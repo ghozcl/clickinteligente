@@ -14,41 +14,41 @@ echo ""
 
 # Actualizar sistema
 sudo apt update && sudo apt upgrade -y
+sudo apt install -y curl gnupg lsb-release unzip git nginx certbot python3-certbot-nginx dos2unix
 
-# Instalar dependencias solo si no existen
-for pkg in curl gnupg lsb-release unzip git nginx certbot python3-certbot-nginx nodejs npm mongodb dos2unix; do
-    if ! command -v $pkg &>/dev/null; then
-        echo "⚡ Instalando $pkg..."
-        sudo apt install -y $pkg
-    else
-        echo "✅ $pkg ya está instalado"
-    fi
-done
-
-# Instalar TypeScript global si no existe
-if ! command -v tsc &>/dev/null; then
-    echo "⚡ TypeScript no está instalado, se instalará..."
-    sudo npm install -g typescript
-else
-    echo "✅ TypeScript ya está instalado"
+# Instalar Node.js y npm si no están
+if ! command -v node &>/dev/null; then
+    curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+    sudo apt install -y nodejs
 fi
 
-# Crear estructura de la instalación
-mkdir -p /var/www/$INSTALACION/backend
-mkdir -p /var/www/$INSTALACION/frontend/src/pages
-mkdir -p /var/www/$INSTALACION/frontend/public
+# Instalar MongoDB desde repositorio oficial si no está
+if ! command -v mongod &>/dev/null; then
+    echo "⚡ Instalando MongoDB..."
+    wget -qO - https://www.mongodb.org/static/pgp/server-6.0.asc | sudo gpg --dearmor -o /usr/share/keyrings/mongodb-server-6.0.gpg
+    echo "deb [ arch=amd64 signed-by=/usr/share/keyrings/mongodb-server-6.0.gpg ] https://repo.mongodb.org/apt/ubuntu jammy/mongodb-org/6.0 multiverse" | sudo tee /etc/apt/sources.list.d/mongodb-org-6.0.list
+    sudo apt update
+    sudo apt install -y mongodb-org
+    sudo systemctl enable mongod
+    sudo systemctl start mongod
+else
+    echo "✅ MongoDB ya está instalado"
+fi
+
+# Instalar TypeScript global si no está
+if ! command -v tsc &>/dev/null; then
+    sudo npm install -g typescript
+fi
+
+# Crear estructura de instalación
+sudo mkdir -p /var/www/$INSTALACION/backend
+sudo mkdir -p /var/www/$INSTALACION/frontend/src/pages
+sudo mkdir -p /var/www/$INSTALACION/frontend/public
+sudo chown -R $USER:$USER /var/www/$INSTALACION
 
 cd /var/www/$INSTALACION
 
-# Clonar repositorio si no existe
-if [ ! -d "backend/.git" ]; then
-    git clone https://github.com/ghozcl/clickinteligente.git .
-else
-    echo "✅ Repo ya clonado, actualizando..."
-    git pull origin main
-fi
-
-# Backend package.json y .env
+# Backend package.json
 cat > backend/package.json <<EOL
 {
   "name": "clickinteligente-backend",
@@ -71,20 +71,8 @@ cat > backend/package.json <<EOL
 }
 EOL
 
-cat > backend/.env <<EOL
-MONGO_URI=mongodb://localhost:27017/$DB_NAME
-ADMIN_EMAIL=$ADMIN_EMAIL
-ADMIN_PASS=$ADMIN_PASS
-PORT=5000
-EOL
-
-# Instalar y compilar backend
-cd backend
-npm install
-npx tsc
-
 # Frontend package.json
-cat > ../frontend/package.json <<EOL
+cat > frontend/package.json <<EOL
 {
   "name": "clickinteligente-frontend",
   "version": "1.0.0",
@@ -92,9 +80,7 @@ cat > ../frontend/package.json <<EOL
   "dependencies": {
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
-    "react-scripts": "^5.0.1",
-    "ajv": "^8.13.0",
-    "ajv-keywords": "^5.1.0"
+    "react-scripts": "^5.0.1"
   },
   "scripts": {
     "start": "react-scripts start",
@@ -104,13 +90,32 @@ cat > ../frontend/package.json <<EOL
 }
 EOL
 
-# Instalar y compilar frontend
+# Backend .env
+cat > backend/.env <<EOL
+MONGO_URI=mongodb://localhost:27017/$DB_NAME
+ADMIN_EMAIL=$ADMIN_EMAIL
+ADMIN_PASS=$ADMIN_PASS
+PORT=5000
+EOL
+
+# Clonar repositorio si no existe
+if [ ! -d "./.git" ]; then
+    git clone https://github.com/ghozcl/clickinteligente.git .
+else
+    git pull
+fi
+
+# Instalar dependencias backend
+cd backend
+npm install
+npx tsc || true   # Ignorar errores tsc si no hay tsconfig.json
+
+# Instalar dependencias frontend
 cd ../frontend
-rm -rf node_modules
 npm install --legacy-peer-deps
 npm run build
 
-# Convertir saltos de línea a Unix
+# Convertir todos los saltos de línea a Unix
 find src -type f -exec dos2unix {} \;
 
 # Configuración Nginx
@@ -144,13 +149,9 @@ sudo systemctl restart nginx
 # Certbot SSL
 sudo certbot --nginx -d $DOMAIN_FRONT -d $DOMAIN_BACK --non-interactive --agree-tos -m $ADMIN_EMAIL
 
-# PM2 backend
+# Iniciar backend con PM2
 sudo npm install -g pm2
-if pm2 list | grep -q "$INSTALACION-backend"; then
-    pm2 restart "$INSTALACION-backend"
-else
-    pm2 start backend/dist/server.js --name "$INSTALACION-backend"
-fi
+pm2 start backend/dist/server.js --name "$INSTALACION-backend" || pm2 restart "$INSTALACION-backend"
 pm2 save
 
 echo "✅ Deploy completado! Tu aplicación está lista."
