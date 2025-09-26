@@ -21,4 +21,6 @@ routes.put("/chats/:id", isAuth, ChatController.update);
 
 routes.delete("/chats/:id", isAuth, ChatController.remove);
 
+routes.post("/chats/:id/disable", isAuth, ChatController.disable);
+
 export default routes;

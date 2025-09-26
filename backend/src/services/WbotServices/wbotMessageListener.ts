@@ -1,13 +1,21 @@
+import axios from "axios"; // 👈 Agregar arriba en el archivo
+import uploadConfig from "../../config/upload";
+import { convertToMp3 } from "../../helpers/convertToMp3";
+import { downloadMediaMessage, MediaDownloadOptions } from "@whiskeysockets/baileys";
+import { exec } from "child_process";
+import { BaileysEventMap } from "@whiskeysockets/baileys";
+import WebhookService from "../WebhookService";
 import * as Sentry from "@sentry/node";
 import { writeFile } from "fs";
 import { head, isNil } from "lodash";
 import path, { join } from "path";
 import { promisify } from "util";
+import { Chat as BaileysChat } from "@whiskeysockets/baileys";
 
+import Chat from "../../models/Chat";
 import { map_msg } from "../../utils/global";
 
 import {
-  downloadMediaMessage,
   extractMessageContent,
   getContentType,
   jidNormalizedUser,
@@ -17,7 +25,6 @@ import {
   WAMessageStubType,
   WAMessageUpdate,
   delay,
-  Chat,
   WASocket,
 } from "@whiskeysockets/baileys";
 import Contact from "../../models/Contact";
@@ -890,49 +897,61 @@ const verifyMediaMessage = async (
     const ext = media.mimetype.split("/")[1].split(";")[0];
     media.filename = `${new Date().getTime()}.${ext}`;
   }
-
-  try {
-
-    const folder = `public/company${ticket.companyId}`;
-    if (!fs.existsSync(folder)) {
-      fs.mkdirSync(folder);
-      fs.chmodSync(folder, 0o777)
-    }
-
-    await writeFileAsync(
-      join(__dirname, "..", "..", "..", folder, media.filename),
-      media.data,
-      "base64"
-    );
-
-    // Espera hasta que termine la conversión o se determine que no es necesaria
-    await new Promise<void>((resolve, reject) => {
-      // Verifica si el archivo es del tipo .ogg
-      if (media.filename.includes('.ogg')) {
-        // Si es .ogg, usa ffmpeg para convertirlo a formato .mp3
-        ffmpeg(folder + '/' + media.filename)
-          .toFormat('mp3')
-          .save((folder + '/' + media.filename).replace('.ogg', '.mp3')) // Guarda el archivo con extensión .mp3
-          .on('end', () => {
-            logger.info('¡Conversión concluida!');
-            resolve(); // Finaliza la promesa exitosamente
-          })
-          .on('error', (err) => {
-            logger.error('Error durante la conversión:', err);
-            reject(err); // Finaliza la promesa con error
-          });
-      } else {
-        // Si no es un archivo .ogg, no es necesario convertirlo
-        logger.info('No es necesario convertir el archivo. No es formato OGG.');
-        resolve(); // Finaliza la promesa inmediatamente
-      }
-    });
-
-  } catch (err) {
-    Sentry.captureException(err);
-    logger.error(err);
+try {
+  const folder = path.join(uploadConfig.directory, `company${ticket.companyId}`);
+  if (!fs.existsSync(folder)) {
+    fs.mkdirSync(folder, { recursive: true });
+    fs.chmodSync(folder, 0o777);
   }
 
+  const inputPath = path.join(folder, media.filename);
+  await writeFileAsync(inputPath, media.data, "base64");
+
+  // Espera hasta que termine la conversión o se determine que no es necesaria
+  await new Promise<void>((resolve, reject) => {
+    try {
+      if (media.filename && media.filename.toLowerCase().endsWith(".ogg")) {
+        const outputPath = inputPath.replace(/\.ogg$/i, ".mp3");
+
+        ffmpeg(inputPath)
+          .toFormat("mp3")
+          .on("progress", (progress) => {
+            if (progress && progress.percent) {
+              logger.info(`🔄 Convirtiendo... ${progress.percent.toFixed(2)}% completado`);
+            }
+          })
+          .on("end", () => {
+            logger.info(`✅  Conversión concluida: ${outputPath}`);
+
+            // Opcional: borrar el archivo .ogg original
+            fs.unlink(inputPath, (err) => {
+              if (err) {
+                logger.warn(`⚠️ No se pudo borrar el archivo original: ${inputPath}`);
+              } else {
+                logger.info(`🗑️  Archivo original borrado: ${inputPath}`);
+              }
+              resolve();
+            });
+          })
+          .on("error", (err) => {
+            logger.error("❌  Error durante la conversión:", err);
+            reject(err);
+          })
+          .save(outputPath);
+      } else {
+        logger.info("ℹ️ No es necesario convertir el archivo. No es formato OGG.");
+        resolve();
+      }
+    } catch (err) {
+      logger.error("❌  Error en bloque de conversión:", err);
+      reject(err);
+    }
+  });
+
+} catch (err) {
+  Sentry.captureException(err);
+  logger.error(err);
+}
   const body = getBodyMessage(msg);
 
 
@@ -1837,6 +1856,7 @@ const option = letterIndex >= 0 && letterIndex < queue?.options.length ? queue.o
   }
 }
 
+
 export const handleMessageIntegration = async (
   msg: proto.IWebMessageInfo,
   wbot: Session,
@@ -1844,55 +1864,62 @@ export const handleMessageIntegration = async (
   ticket: Ticket
 ): Promise<void> => {
   const msgType = getTypeMessage(msg);
+  const remoteJid = msg.key?.remoteJid || "";
+  const fromMe = msg.key?.fromMe || false;
 
-if (queueIntegration.type === "n8n" || queueIntegration.type === "webhook") {
-  if (!queueIntegration?.urlN8N) {
-    logger.error(`No se proporcionó una URL válida para la integración ${queueIntegration.type} (ID: ${queueIntegration.id})`);
-    throw new Error("URL de integración n8n/webhook no proporcionada");
+  // 🔹 FILTRO DE MENSAJES NO REALES
+  const isNewsletter = remoteJid.includes("newsletter");
+  const isStatusMsg = msgType === "protocol" || msgType === "reaction" || msgType === "ephemeral";
+  const isGroupMsg = remoteJid.endsWith("@g.us");
+
+  if (isNewsletter || isStatusMsg || fromMe || isGroupMsg) {
+    logger.info(`Mensaje ignorado: tipo no válido, newsletter, grupo o mensaje propio (${remoteJid})`);
+    return; // Salimos sin enviar a n8n
   }
-  // Validar que la URL sea un formato válido
-  const urlRegex = /^(https?:\/\/[^\s$.?#].[^\s]*)$/;
-  if (!urlRegex.test(queueIntegration.urlN8N)) {
-    logger.error(`URL inválida para integración ${queueIntegration.type}: ${queueIntegration.urlN8N}`);
-    throw new Error("URL de integración n8n/webhook inválida");
-  }
-  const options = {
-    method: "POST",
-    url: queueIntegration.urlN8N,
-    headers: {
-      "Content-Type": "application/json"
-    },
-    json: msg
-  };
-      try {
-  request(options, function (error, response) {
-    if (error) {
-      logger.error(`Error al enviar solicitud a n8n/webhook (${queueIntegration.urlN8N}): ${error.message}`);
-      throw new Error(`Error en la solicitud a n8n/webhook: ${error.message}`);
+
+  // 🔹 INTEGRACIÓN CON N8N/WEBHOOK
+  if (queueIntegration.type === "n8n" || queueIntegration.type === "webhook") {
+    if (!queueIntegration?.urlN8N) {
+      logger.error(`No se proporcionó URL válida para la integración ${queueIntegration.type} (ID: ${queueIntegration.id})`);
+      throw new Error("URL de integración n8n/webhook no proporcionada");
     }
-    if (response.statusCode !== 200) {
-      logger.error(`Respuesta no exitosa de n8n/webhook (${queueIntegration.urlN8N}): Código ${response.statusCode}, Mensaje: ${JSON.stringify(response.body)}`);
-      if (response.statusCode === 404) {
-        logger.warn(`Webhook no registrado en n8n. Asegúrese de que el workflow esté activo y no en modo de prueba.`);
+
+    const urlRegex = /^(https?:\/\/[^\s$.?#].[^\s]*)$/;
+    if (!urlRegex.test(queueIntegration.urlN8N)) {
+      logger.error(`URL inválida para integración ${queueIntegration.type}: ${queueIntegration.urlN8N}`);
+      throw new Error("URL de integración n8n/webhook inválida");
+    }
+
+    try {
+      const resp = await axios.post(queueIntegration.urlN8N, msg, {
+        headers: { "Content-Type": "application/json" },
+        timeout: 10000
+      });
+
+      logger.info(`Respuesta exitosa de n8n/webhook (${queueIntegration.urlN8N}): ${JSON.stringify(resp.data)}`);
+    } catch (error: any) {
+      if (error.response) {
+        logger.error(
+          `Respuesta no exitosa de n8n/webhook (${queueIntegration.urlN8N}): Código ${error.response.status}, Mensaje: ${JSON.stringify(error.response.data)}`
+        );
+        if (error.response.status === 404) {
+          logger.warn(`Webhook no registrado en n8n. Asegúrese de que el workflow esté activo y no en modo de prueba.`);
+        }
+      } else {
+        logger.error(`Error al enviar solicitud a n8n/webhook (${queueIntegration.urlN8N}): ${error.message}`);
       }
-      throw new Error(`Respuesta no exitosa de n8n/webhook: Código ${response.statusCode}`);
+      Sentry.captureException(error);
+      logger.warn(`Error en integración ${queueIntegration.type}: ${error.message}`);
+      return; // NO rompe el flujo
     }
-    logger.info(`Respuesta exitosa de n8n/webhook (${queueIntegration.urlN8N}): ${JSON.stringify(response.body)}`);
-  });
-} catch (error) {
-  logger.error(`Error en integración ${queueIntegration.type}: ${error.message}`);
-  Sentry.captureException(error);
-  throw error; // Mantener el lanzamiento del error para mantener la funcionalidad existente
-}
-// Mejora: Mejorado el manejo de errores y logging para integración n8n/webhook
-
   } else if (queueIntegration.type === "typebot") {
     console.log("🤖 ENTRÓ EN EL TYPEBOT");
-    // await typebots(ticket, msg, wbot, queueIntegration);
     await typebotListener({ ticket, msg, wbot, typebot: queueIntegration });
-
   }
-}
+};
+
+
+
 
 const handleMessage = async (
   msg: proto.IWebMessageInfo,
@@ -2557,74 +2584,126 @@ const verifyCampaignMessageAndCloseTicket = async (
 };
 
 
+
+//const convertToMp3 = async (inputPath: string, outputPath: string): Promise<void> => {
+ // return new Promise((resolve, reject) => {
+   // exec(`ffmpeg -y -i "${inputPath}" -ar 16000 -ac 1 "${outputPath}"`, (error) => {
+     // if (error) reject(error);
+     // else resolve();
+  //  });
+ // });
+//};
+
 const filterMessages = (msg: WAMessage): boolean => {
-  if (msg.message?.protocolMessage) return false;
-
-  if ([
-    WAMessageStubType.REVOKE,
-    WAMessageStubType.E2E_DEVICE_CHANGED,
-    WAMessageStubType.E2E_IDENTITY_CHANGED,
-    WAMessageStubType.CIPHERTEXT
-  ].includes(msg.messageStubType)) // <- CORRECCIÓN: Eliminé el "as WAMessageStubType"
-  {
-    return false;
-  }
-
+  if (msg?.message?.protocolMessage) return false;
+  const stubType = msg.messageStubType || 0;
+  if (
+    [
+      WAMessageStubType.REVOKE,
+      WAMessageStubType.E2E_DEVICE_CHANGED,
+      WAMessageStubType.E2E_IDENTITY_CHANGED,
+      WAMessageStubType.CIPHERTEXT
+    ].includes(stubType)
+  ) return false;
   return true;
 };
 
 const wbotMessageListener = async (wbot: Session, companyId: number): Promise<void> => {
+  const downloadAudioWithRetry = async (message: any, retries = 3): Promise<Buffer> => {
+    let attempt = 0;
+    while (attempt < retries) {
+      try {
+        const buffer = await downloadMediaMessage(message, "buffer", {});
+        if (!buffer) throw new Error("No se pudo descargar el audio");
+        return buffer;
+      } catch (err) {
+        attempt++;
+        logger.warn(`Intento ${attempt} fallido para descargar audio ${message.key.id}: ${err}`);
+        if (attempt === retries) throw err;
+        await new Promise(res => setTimeout(res, 1000));
+      }
+    }
+    throw new Error("Falló la descarga de audio tras varios intentos");
+  };
+
   try {
-    wbot.ev.on("messages.upsert", async (messageUpsert: ImessageUpsert) => {
-      const messages = messageUpsert.messages
-        .filter(filterMessages)
-        .map(msg => msg);
+    wbot.ev.on("messages.upsert", async (messageUpsert: BaileysEventMap["messages.upsert"]) => {
+      const messages = messageUpsert.messages.filter(filterMessages);
+      if (!messages.length) return;
 
+      for (const message of messages) {
+        const chatId = message.key.remoteJid; // mapear a Chat.uuid correctamente
 
-
-      if (!messages) return;
-
-      messages.forEach(async (message: proto.IWebMessageInfo) => {
-        const messageExists = await Message.count({
-          where: { id: message.key.id!, companyId }
-        });
-
-        if (!messageExists) {
-          await handleMessage(message, wbot, companyId);
-          await verifyRecentCampaign(message, companyId);
-          await verifyCampaignMessageAndCloseTicket(message, companyId);
+        // 🔹 Chequeo de chat deshabilitado antes de procesar nada
+        const chat = await Chat.findOne({ where: { uuid: chatId } });
+        if (chat?.botDisabled) {
+          logger.info(`Chat ${chatId} deshabilitado, no se procesa ni se envía a Make.`);
+          continue;
         }
-      });
+
+        const exists = await Message.count({ where: { id: message.key.id!, companyId } });
+        if (exists) continue;
+
+        // Procesamiento normal
+        await handleMessage(message, wbot, companyId);
+        await verifyRecentCampaign(message, companyId);
+        await verifyCampaignMessageAndCloseTicket(message, companyId);
+
+        // Construimos el payload base
+        let webhookPayload: any = {
+          from: message.key.remoteJid,
+          timestamp: message.messageTimestamp,
+          messageId: message.key.id,
+          text: message.message?.conversation || message.message?.extendedTextMessage?.text,
+        };
+
+        // 🔹 Audio: guardamos en nuestro servidor y generamos URL propia
+        if (message.message?.audioMessage) {
+          try {
+            const audioBuffer = await downloadAudioWithRetry(message);
+            const companyDir = path.join(uploadConfig.directory, `company${companyId}`, "audios");
+            await fs.promises.mkdir(companyDir, { recursive: true });
+            const safeId = message.key.id!.replace(/[^a-zA-Z0-9_-]/g, "");
+            const tempFile = path.join(companyDir, `${safeId}.ogg`);
+            const mp3File = path.join(companyDir, `${safeId}.mp3`);
+            await fs.promises.writeFile(tempFile, audioBuffer);
+            await convertToMp3(tempFile, mp3File);
+            await fs.promises.unlink(tempFile);
+            const audioUrl = `${process.env.APP_PUBLIC_URL || "https://api.clickinteligente.cl"}/public/company${companyId}/audios/${safeId}.mp3`;
+            logger.info(`✅  Audio listo: ${audioUrl}`);
+            webhookPayload.audioUrl = audioUrl;
+          } catch (audioError) {
+            logger.error(`Error procesando audio del mensaje ${message.key.id}: ${audioError}`);
+            Sentry.captureException(audioError);
+          }
+        }
+
+        // 🔹 Enviamos el payload final a Make
+        await WebhookService.triggerWebhook("whatsapp_message", webhookPayload);
+      }
     });
 
-    wbot.ev.on("messages.update", (messageUpdate: WAMessageUpdate[]) => {
-      if (messageUpdate.length === 0) return;
-      messageUpdate.forEach(async (message: WAMessageUpdate) => {
-        (wbot as WASocket)!.readMessages([message.key])
-
+    // Mensajes actualizados
+    wbot.ev.on("messages.update", async (messageUpdate: WAMessageUpdate[]) => {
+      if (!messageUpdate.length) return;
+      for (const message of messageUpdate) {
+        (wbot as WASocket)!.readMessages([message.key]);
         await addMsgAckJob(message, message.update.status);
-      });
+      }
     });
 
-    wbot.ev.on("messages.update", (messageUpdate: WAMessageUpdate[]) => {
-      if (messageUpdate.length === 0) return;
-      messageUpdate.forEach(async (message: WAMessageUpdate) => {
-        await addMsgAckJob(message, message.update.status);
-      });
-    });
-
-    wbot.ev.on("chats.update", async (chatUpdate: Partial<Chat>[]) => {
-      if (chatUpdate.length === 0) return;
-
-      chatUpdate.forEach(async (chat: Partial<Chat>) => {
+    // Chats actualizados
+    wbot.ev.on("chats.update", async (chatUpdate: Partial<BaileysChat>[]) => {
+      if (!chatUpdate.length) return;
+      for (const chat of chatUpdate) {
         await CreateOrUpdateBaileysChatService(wbot.id, chat);
-      });
+      }
     });
+
   } catch (error) {
     Sentry.captureException(error);
-    logger.error(`Error handling wbot message listener. Err: ${error}`);
+    logger.error(`Error en wbotMessageListener: ${error}`);
   }
 };
 
-
-export { handleMessage, wbotMessageListener };
+export { wbotMessageListener, handleMessage };

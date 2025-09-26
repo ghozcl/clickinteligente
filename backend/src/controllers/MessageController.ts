@@ -1,3 +1,7 @@
+// al inicio del archivo MessageController.ts (junto con otros imports)
+import fs from "fs/promises";
+import * as AudioProcessingService from "../services/AudioProcessingService";
+import WebhookService from "../services/WebhookService"; // ajusta ruta si es diferente
 import { Request, Response } from "express";
 import AppError from "../errors/AppError";
 
@@ -79,13 +83,69 @@ export const store = async (req: Request, res: Response): Promise<Response> => {
   SetTicketMessagesAsRead(ticket);
 
   console.log('📄 CUERPO DE LA SOLICITUD:', body);
-  if (medias) {
-    await Promise.all(
-      medias.map(async (media: Express.Multer.File, index) => {
-        await SendWhatsAppMedia({ media, ticket, body: Array.isArray(body) ? body[index] : body });
-      })
-    );
-  } else {
+  
+if (medias) {
+  await Promise.all(
+    medias.map(async (media: Express.Multer.File, index) => {
+      try {
+        const originalPath = media.path as string;
+
+        // 1️⃣ Procesar audio: descifrar + convertir a MP3
+        const processed = await AudioProcessingService.processEncryptedAudioFile(originalPath, {
+          key: process.env.AUDIO_CRYPTO_KEY,
+          iv: process.env.AUDIO_CRYPTO_IV,
+          algorithm: process.env.AUDIO_CRYPTO_ALGO || "aes-256-cbc",
+          outputFormat: "mp3",
+          exposePublicUrl: true,
+          publicBase: process.env.APP_PUBLIC_URL
+        });
+
+        // 2️⃣ Enviar payload al webhook de Make/N8N
+        const payloadForMake = {
+          ticketId: ticket.id,
+          fileName: path.basename(processed.filePath),
+          mimeType: processed.mimeType,
+          publicUrl: processed.publicUrl // Make descarga desde aquí
+        };
+        await WebhookService.triggerWebhook("whatsapp_message", payloadForMake);
+
+        // 3️⃣ Preparar archivo para envío interno a WhatsApp
+        const mediaForSend: Express.Multer.File = {
+          fieldname: "medias",
+          originalname: media.originalname,
+          encoding: media.encoding,
+          mimetype: "audio/mpeg",
+          size: (await fs.stat(processed.filePath)).size,
+          destination: path.dirname(processed.filePath),
+          filename: path.basename(processed.filePath),
+          path: processed.filePath,
+          buffer: Buffer.alloc(0) // no usado por SendWhatsAppMedia si usa .path
+        } as unknown as Express.Multer.File;
+
+        // 4️⃣ Enviar audio al flujo interno
+        await SendWhatsAppMedia({
+          media: mediaForSend,
+          ticket,
+          body: Array.isArray(body) ? body[index] : body
+        });
+
+        // Opcional: limpiar archivo convertido
+        // await AudioProcessingService.cleanupFile(processed.filePath);
+
+      } catch (err) {
+        console.error("Error procesando audio:", err);
+        // fallback: enviar el media original si algo falla
+        await SendWhatsAppMedia({
+          media,
+          ticket,
+          body: Array.isArray(body) ? body[index] : body
+        });
+      }
+    })
+  );
+}
+
+ else {
     const send = await SendWhatsAppMessage({ body, ticket, quotedMsg });
   }
 

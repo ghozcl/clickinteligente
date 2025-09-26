@@ -10,7 +10,8 @@
     "emitDecoratorMetadata": true,
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
-	"types": ["node"]
+    "types": ["node"]
   },
-    "exclude": ["public"]
+  "include": ["src/**/*"],  // 👈 Agregado
+  "exclude": ["public"]
 }
